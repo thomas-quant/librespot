@@ -19,7 +19,10 @@ use librespot::{
         Error, FileId, SpotifyId, SpotifyUri, authentication::Credentials, cdn_url::CdnUrl,
         config::SessionConfig, session::Session,
     },
-    metadata::audio::{AudioFileFormat, AudioItem},
+    metadata::{
+        audio::{AudioFileFormat, AudioItem},
+        track::Tracks,
+    },
     oauth::OAuthClientBuilder,
 };
 
@@ -165,11 +168,47 @@ async fn main() {
         Err(reason) => println!("      availability: RESTRICTED ({reason:?})"),
     }
 
-    if audio_item.files.is_empty() {
-        println!("FAIL  no audio files offered for this track on this account.");
-        println!("      This is itself a strong signal: the catalogue withheld every format.");
+    // An available track with no files is normal: Spotify relinks tracks per market, so
+    // the canonical ID often carries nothing and a market-specific alternative holds the
+    // files. `Player::find_available_alternative` does this same walk before giving up.
+    let playable = if !audio_item.files.is_empty() {
+        Some(audio_item)
+    } else {
+        let alternatives = audio_item
+            .alternatives
+            .clone()
+            .unwrap_or(Tracks(Vec::new()));
+        println!(
+            "      no files on the canonical ID — following {} alternative(s)",
+            alternatives.len()
+        );
+
+        let mut found = None;
+        for alt_uri in alternatives.0 {
+            match AudioItem::get_file(&session, alt_uri.clone()).await {
+                Ok(alt) if alt.availability.is_ok() && !alt.files.is_empty() => {
+                    println!("      relinked to {}", alt.uri);
+                    found = Some(alt);
+                    break;
+                }
+                Ok(alt) => println!(
+                    "      skip {} (available: {}, files: {})",
+                    alt.uri,
+                    alt.availability.is_ok(),
+                    alt.files.len()
+                ),
+                Err(e) => println!("      skip {alt_uri} ({})", describe(&e)),
+            }
+        }
+        found
+    };
+
+    let Some(audio_item) = playable else {
+        println!("FAIL  no playable file on this track or any alternative.");
+        println!("      Try another track before concluding anything about the tier — this");
+        println!("      can also mean the track simply is not licensed in your market.");
         return;
-    }
+    };
 
     let mut offered: Vec<(AudioFileFormat, FileId)> =
         audio_item.files.iter().map(|(f, id)| (*f, *id)).collect();
@@ -185,16 +224,31 @@ async fn main() {
     println!("This is the question. AesKey = the legacy path serves this tier.");
     println!("AesKeyError = the server refused, and free support needs a path we won't build.\n");
 
-    let mut granted = 0usize;
-    for (format, file_id) in &offered {
-        match session.audio_key().request(track_id, *file_id).await {
-            Ok(_key) => {
-                granted += 1;
-                println!("  GRANTED  {format:?}");
-            }
-            Err(e) => println!("  REFUSED  {format:<18?} {}", describe(&e)),
+    // After relinking, the file belongs to the alternative but `Player` keeps requesting
+    // with the originally-requested ID (playback/src/player.rs:1110). Try both when they
+    // differ, so a refusal can be pinned on the tier rather than on the wrong ID.
+    let relinked_id: Option<SpotifyId> = (&audio_item.track_id).try_into().ok();
+    let mut key_ids = vec![("requested", track_id)];
+    if let Some(id) = relinked_id {
+        if id != track_id {
+            println!("Track was relinked, so trying both IDs against each file.\n");
+            key_ids.push(("relinked", id));
         }
     }
+
+    let mut granted = 0usize;
+    for (format, file_id) in &offered {
+        for (label, id) in &key_ids {
+            match session.audio_key().request(*id, *file_id).await {
+                Ok(_key) => {
+                    granted += 1;
+                    println!("  GRANTED  {format:<18?} ({label} id)");
+                }
+                Err(e) => println!("  REFUSED  {format:<18?} ({label} id) {}", describe(&e)),
+            }
+        }
+    }
+    let attempts = offered.len() * key_ids.len();
 
     // ── 5. CDN URL ───────────────────────────────────────────────────────────────
     step(5, "Resolve a CDN URL");
@@ -226,10 +280,10 @@ async fn main() {
     let tier = session.account_type().unwrap_or_else(|| "unknown".into());
     println!("account tier:     {tier}");
     println!("formats offered:  {}", offered.len());
-    println!("keys granted:     {granted}");
+    println!("keys granted:     {granted}/{attempts}");
 
     println!();
-    if granted == offered.len() {
+    if granted == attempts {
         println!("GREEN  Every key was granted. The legacy path serves this tier, and the");
         println!("       remaining work is the tier-correctness patch, not protocol work.");
     } else if granted > 0 {
