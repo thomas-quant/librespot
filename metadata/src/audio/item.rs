@@ -219,7 +219,13 @@ fn get_covers(covers: Images, image_url: String) -> Vec<CoverImage> {
 
 fn allowed_for_user(user_data: &UserData, restrictions: &Restrictions) -> AudioItemAvailability {
     let country = &user_data.country;
-    let user_catalogue = match user_data.attributes.get("catalogue") {
+    // Prefer the explicit catalogue, then the account tier. Only assume premium when the
+    // server has told us nothing at all, which is the case before `ProductInfo` arrives.
+    let user_catalogue = match user_data
+        .attributes
+        .get("catalogue")
+        .or_else(|| user_data.attributes.get("type"))
+    {
         Some(catalogue) => catalogue,
         None => "premium",
     };

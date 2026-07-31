@@ -3,7 +3,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    process::exit,
     sync::{Arc, OnceLock, RwLock, Weak},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -361,14 +360,14 @@ impl Session {
         );
     }
 
+    // Upstream librespot aborts the process here for any non-premium account. This fork
+    // reports the tier instead and lets the server decide what the account is entitled to:
+    // a rejected request surfaces as a normal protocol error at the call site.
     fn check_catalogue(attributes: &UserAttributes) {
         if let Some(account_type) = attributes.get("type") {
             if account_type != "premium" {
-                error!("librespot does not support {account_type:?} accounts.");
-                info!("Please support Spotify and your artists and sign up for a premium account.");
-
-                // TODO: logout instead of exiting
-                exit(1);
+                warn!("Account type is {account_type:?}, not \"premium\".");
+                warn!("Streaming may be refused by the server on this account tier.");
             }
         }
     }
@@ -581,6 +580,26 @@ impl Session {
             Some(value) => matches!(&*value, "1"),
             None => false,
         }
+    }
+
+    /// The account tier reported by the server, e.g. `"premium"` or `"free"`.
+    ///
+    /// [`None`] until the `ProductInfo` packet has been received.
+    pub fn account_type(&self) -> Option<String> {
+        self.get_user_attribute("type")
+    }
+
+    /// The content catalogue the account is entitled to, e.g. `"premium"` or `"free"`.
+    ///
+    /// Falls back to [`Self::account_type`] when the server does not send an explicit
+    /// `catalogue` attribute.
+    pub fn catalogue(&self) -> Option<String> {
+        self.get_user_attribute("catalogue")
+            .or_else(|| self.account_type())
+    }
+
+    pub fn is_premium(&self) -> bool {
+        matches!(self.account_type().as_deref(), Some("premium"))
     }
 
     pub fn autoplay(&self) -> bool {
