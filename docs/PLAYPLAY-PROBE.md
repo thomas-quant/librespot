@@ -197,8 +197,10 @@ access; Windows ACLs govern Windows-side access.
 - **2:** invalid CLI or report destination; no live request made.
 - **3:** complete non-2xx response, with original-response summary saved.
 - **4:** response headers arrived but body capture was incomplete/truncated.
-- **5:** explicit real-data mode ran, but neither historical candidate decoded the
-  required prefix. This is not a verdict on all v5 transformations or Free playback.
+- **5:** explicit real-data mode ran, but all named candidate/settings and the
+  undecrypted control failed content checks. This is not a verdict on all v5
+  transformations or Free playback. Resource/setup/short-prefix failures are
+  inconclusive diagnostic errors, not this negative outcome.
 
 Request-only reports leave licensing, decryption, playback and universal tier
 restriction claims unestablished. Real-data mode may validate only a decoded

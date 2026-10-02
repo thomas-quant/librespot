@@ -246,13 +246,22 @@ fn protobuf_shape(input: &[u8]) -> Option<[Option<usize>; 2]> {
     Some(sizes)
 }
 
-/// Copy pre-transform material only, never interpret it as an audio key.
+/// Private in-memory envelope, deliberately without Debug/serialization.
+/// Neither member is named or treated as a validated key or policy value.
+pub struct ResponseEnvelope {
+    pub material: [u8; 16],
+    pub ancillary: Option<Vec<u8>>,
+}
+
+/// Retain both observed fields without inventing field-2 semantics or fallback.
 /// The same conservative shape checks used by the report reject ambiguity.
-pub fn response_material(input: &[u8]) -> Option<[u8; 16]> {
+pub fn response_envelope(input: &[u8]) -> Option<ResponseEnvelope> {
     if protobuf_shape(input)?[0] != Some(16) {
         return None;
     }
     let mut position = 0;
+    let mut material = None;
+    let mut ancillary = None;
     while position < input.len() {
         let tag = read_varint(input, &mut position)?;
         let size = match tag & 7 {
@@ -266,12 +275,22 @@ pub fn response_material(input: &[u8]) -> Option<[u8; 16]> {
             _ => return None,
         };
         let end = position.checked_add(size)?;
-        if tag >> 3 == 1 {
-            return input.get(position..end)?.try_into().ok();
+        match tag >> 3 {
+            1 => material = Some(input.get(position..end)?.try_into().ok()?),
+            2 => ancillary = Some(input.get(position..end)?.to_vec()),
+            _ => (),
         }
         position = end;
     }
-    None
+    Some(ResponseEnvelope {
+        material: material?,
+        ancillary,
+    })
+}
+
+#[cfg(test)]
+fn response_material(input: &[u8]) -> Option<[u8; 16]> {
+    response_envelope(input).map(|envelope| envelope.material)
 }
 
 fn known_error(value: &Value) -> Option<&'static str> {
@@ -688,6 +707,23 @@ mod tests {
                 assert_eq!(summary["playback_tested"], false);
             }
         }
+    }
+
+    #[test]
+    fn private_envelope_preserves_ancillary_presence_without_semantics() {
+        for second in [None, Some(0), Some(3), Some(4), Some(5)] {
+            let input = response_fixture(Some(16), second);
+            let envelope = response_envelope(&input).unwrap();
+            assert_eq!(envelope.material, [0xaa; 16]);
+            assert_eq!(envelope.ancillary.as_ref().map(Vec::len), second);
+            assert_eq!(envelope.ancillary, second.map(|n| vec![0xaa; n]));
+        }
+        // Wire order does not change the envelope, and neither field is logged.
+        let mut input = response_fixture(None, Some(4));
+        input.extend(response_fixture(Some(16), None));
+        assert_eq!(response_envelope(&input).unwrap().material, [0xaa; 16]);
+        input.extend(response_fixture(None, Some(4)));
+        assert!(response_envelope(&input).is_none());
     }
 
     #[test]

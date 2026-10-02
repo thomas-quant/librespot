@@ -488,11 +488,11 @@ async fn live(
             return Err(Failure::new("response_contract", "expected_http_200"));
         }
         if status == 200 && capture.complete {
-            let material = probe::response_material(&capture.bytes)
+            let envelope = probe::response_envelope(&capture.bytes)
                 .ok_or_else(|| Failure::new("response_contract", "expected_single_16byte_field"))?;
             decode::run(
                 file,
-                material,
+                &envelope,
                 candidate,
                 audio
                     .as_deref()
