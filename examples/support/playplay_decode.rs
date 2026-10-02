@@ -162,7 +162,9 @@ fn trusted_cdn(value: &str) -> bool {
             && u.password().is_none()
             && u.fragment().is_none()
             && u.host_str().is_some_and(|h| {
-                h.ends_with(".spotifycdn.com") || h == "audio-ak-spotify-com.akamaized.net"
+                h.ends_with(".spotifycdn.com")
+                    || h.ends_with(".scdn.co")
+                    || h == "audio-ak-spotify-com.akamaized.net"
             })
     })
 }
@@ -538,6 +540,10 @@ mod tests {
         assert!(trusted_cdn(
             "https://audio-cf.spotifycdn.com/audio/test?verify=not_logged"
         ));
+        assert!(trusted_cdn(
+            "https://audio4-fa.scdn.co/audio/test?verify=not_logged"
+        ));
+        assert!(!trusted_cdn("https://scdn.co.evil.invalid/audio/test"));
         for bad in [
             "http://audio-cf.spotifycdn.com/a",
             "https://spotifycdn.com.evil.invalid/a",
