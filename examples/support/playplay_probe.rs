@@ -201,12 +201,14 @@ fn read_varint(input: &[u8], position: &mut usize) -> Option<u64> {
     None
 }
 
-/// Syntax/shape only. A 16-byte field 1 is NOT a validated license or audio key.
-/// Return nested Option to distinguish malformed protobuf from an absent field.
-fn protobuf_shape(input: &[u8]) -> Option<Option<usize>> {
+/// Shape only: lengths of fields 1 and 2, not a license or an audio key.
+/// Absent fields remain `None`. This conservative inspector is NOT a clone of
+/// the native parser: duplicate/wrong-wire known fields, groups and over-budget
+/// messages are unclassified, not necessarily invalid protobuf. Nonminimal
+/// varints are accepted; no native canonical-encoding rule is inferred.
+fn protobuf_shape(input: &[u8]) -> Option<[Option<usize>; 2]> {
     let mut position = 0;
-    let mut field1_size = None;
-    let mut field1_seen = false;
+    let mut sizes = [None; 2];
     let mut fields = 0;
     while position < input.len() {
         fields += 1;
@@ -229,19 +231,19 @@ fn protobuf_shape(input: &[u8]) -> Option<Option<usize>> {
             5 => 4,
             _ => return None,
         };
-        if field == 1 {
-            if field1_seen || wire != 2 {
+        if (1..=2).contains(&field) {
+            let index = (field - 1) as usize;
+            if sizes[index].is_some() || wire != 2 {
                 return None;
             }
-            field1_seen = true;
-            field1_size = Some(size);
+            sizes[index] = Some(size);
         }
         position = position.checked_add(size)?;
         if position > input.len() {
             return None;
         }
     }
-    Some(field1_size)
+    Some(sizes)
 }
 
 fn known_error(value: &Value) -> Option<&'static str> {
@@ -307,7 +309,7 @@ fn numeric_header(headers: &HeaderMap, name: header::HeaderName) -> Option<u64> 
 /// URLs, cookies, keys, tokens, or username can escape through this function.
 pub fn response_summary(status: u16, headers: &HeaderMap, capture: &Capture) -> Value {
     let mut shape = "unavailable";
-    let mut field1_size = None;
+    let mut field_sizes = [None; 2];
     let mut error = None;
     if capture.complete {
         if capture.bytes.is_empty() {
@@ -315,9 +317,9 @@ pub fn response_summary(status: u16, headers: &HeaderMap, capture: &Capture) -> 
         } else if let Ok(value) = serde_json::from_slice::<Value>(&capture.bytes) {
             shape = "json";
             error = known_error(&value);
-        } else if let Some(size) = protobuf_shape(&capture.bytes) {
+        } else if let Some(sizes) = protobuf_shape(&capture.bytes) {
             shape = "protobuf_syntax_only";
-            field1_size = size;
+            field_sizes = sizes;
         } else {
             shape = "unrecognized";
         }
@@ -336,7 +338,8 @@ pub fn response_summary(status: u16, headers: &HeaderMap, capture: &Capture) -> 
         "body_failure": capture.failure,
         "body_shape": shape,
         "recognized_error_code": error,
-        "field_1_length_if_protobuf": field1_size,
+        "field_1_length_if_protobuf": field_sizes[0],
+        "field_2_length_if_protobuf": field_sizes[1],
         "license_validated": false,
         "decryption_tested": false,
         "playback_tested": false,
@@ -625,6 +628,160 @@ mod tests {
             response_summary(403, &headers, &capture)["recognized_error_code"],
             Value::Null
         );
+    }
+
+    fn response_fixture(first: Option<usize>, second: Option<usize>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (field, size) in [(1, first), (2, second)] {
+            if let Some(size) = size {
+                blob(field, &vec![0xaa; size], &mut bytes);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn response_field_lengths_are_observations_not_validation() {
+        for first in [None, Some(0), Some(15), Some(16), Some(17)] {
+            for second in [None, Some(0), Some(3), Some(4), Some(5)] {
+                let bytes = response_fixture(first, second);
+                assert_eq!(protobuf_shape(&bytes), Some([first, second]));
+                let capture = Capture {
+                    observed_bytes: bytes.len(),
+                    bytes,
+                    complete: true,
+                    failure: None,
+                };
+                let summary = response_summary(200, &HeaderMap::new(), &capture);
+                assert_eq!(summary["field_1_length_if_protobuf"], json!(first));
+                assert_eq!(summary["field_2_length_if_protobuf"], json!(second));
+                assert_eq!(summary["license_validated"], false);
+                assert_eq!(summary["decryption_tested"], false);
+                assert_eq!(summary["playback_tested"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_two_field_envelope_is_24_bytes_not_a_live_reconstruction() {
+        let bytes = response_fixture(Some(16), Some(4));
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(protobuf_shape(&bytes), Some([Some(16), Some(4)]));
+        // A complete first field alone is also recognized; field 2 is optional
+        // to this inspector. Missing field 2 does not imply a zero-valued field.
+        assert_eq!(protobuf_shape(&bytes[..18]), Some([Some(16), None]));
+        for end in 1..bytes.len() {
+            if end != 18 {
+                assert_eq!(protobuf_shape(&bytes[..end]), None, "prefix {end}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_wire_fields_do_not_acquire_semantics() {
+        let mut bytes = response_fixture(Some(16), Some(4));
+        scalar(3, 9, &mut bytes);
+        bytes.push((4 << 3) | 1);
+        bytes.extend_from_slice(&[0; 8]);
+        blob(5, b"DO_NOT_LEAK", &mut bytes);
+        bytes.push((6 << 3) | 5);
+        bytes.extend_from_slice(&[0; 4]);
+        assert_eq!(protobuf_shape(&bytes), Some([Some(16), Some(4)]));
+        let unknown_only = &bytes[24..];
+        assert_eq!(protobuf_shape(unknown_only), Some([None, None]));
+        // Repeated unknown fields remain opaque rather than being interpreted
+        // as another key, policy value, or native parser acceptance rule.
+        bytes.extend_from_within(24..);
+        assert_eq!(protobuf_shape(&bytes), Some([Some(16), Some(4)]));
+    }
+
+    #[test]
+    fn duplicate_or_wrong_wire_known_fields_are_conservatively_unclassified() {
+        for field in [1, 2] {
+            for size in [0, 4, 16] {
+                let mut bytes = response_fixture(Some(16), Some(4));
+                blob(field, &vec![0; size], &mut bytes);
+                assert_eq!(protobuf_shape(&bytes), None);
+            }
+            for wire in [0, 1, 5] {
+                let size = match wire {
+                    1 => 8,
+                    5 => 4,
+                    _ => 1,
+                };
+                let mut bytes = vec![(field << 3) | wire];
+                bytes.resize(bytes.len() + size, 0);
+                assert_eq!(protobuf_shape(&bytes), None);
+            }
+        }
+        // Legal protobuf groups are outside this inspector's supported subset.
+        assert_eq!(protobuf_shape(&[0x1b, 0x1c]), None);
+    }
+
+    #[test]
+    fn response_varints_and_inspection_budget_have_explicit_boundaries() {
+        // Nonminimal tag and length encodings remain syntax-only observations.
+        let mut nonminimal = vec![0x8a, 0, 0x90, 0];
+        nonminimal.extend_from_slice(&[0xaa; 16]);
+        nonminimal.extend_from_slice(&[0x92, 0, 0x84, 0]);
+        nonminimal.extend_from_slice(&[0xaa; 4]);
+        assert_eq!(protobuf_shape(&nonminimal), Some([Some(16), Some(4)]));
+
+        let mut maximum_field = Vec::new();
+        varint((0x1fff_ffff_u64 << 3) | 2, &mut maximum_field);
+        maximum_field.push(0);
+        assert_eq!(protobuf_shape(&maximum_field), Some([None, None]));
+        let mut oversized_field = Vec::new();
+        varint(0x2000_0000_u64 << 3, &mut oversized_field);
+        oversized_field.push(0);
+        assert_eq!(protobuf_shape(&oversized_field), None);
+        let mut impossible_length = vec![0x0a];
+        varint(u64::MAX, &mut impossible_length);
+        assert_eq!(protobuf_shape(&impossible_length), None);
+        assert_eq!(protobuf_shape(&[0x18, 0x80]), None);
+        assert_eq!(protobuf_shape(&[0x0a, 0x80]), None);
+
+        let mut maximum_fields = [0x18, 0].repeat(1024);
+        assert_eq!(protobuf_shape(&maximum_fields), Some([None, None]));
+        maximum_fields.extend_from_slice(&[0x18, 0]);
+        assert_eq!(protobuf_shape(&maximum_fields), None);
+    }
+
+    #[test]
+    fn response_material_never_escapes_even_with_matching_lengths() {
+        let mut bytes = Vec::new();
+        blob(1, b"KEY_MATERIAL_123", &mut bytes);
+        blob(2, b"LEAK", &mut bytes);
+        assert_eq!(bytes.len(), 24);
+        let mut capture = Capture {
+            observed_bytes: bytes.len(),
+            bytes,
+            complete: true,
+            failure: None,
+        };
+        for status in [200, 201, 403] {
+            let summary = response_summary(status, &HeaderMap::new(), &capture);
+            assert_eq!(summary["field_1_length_if_protobuf"], 16);
+            assert_eq!(summary["field_2_length_if_protobuf"], 4);
+            for flag in [
+                "license_validated",
+                "decryption_tested",
+                "playback_tested",
+                "tier_restriction_established",
+            ] {
+                assert_eq!(summary[flag], false);
+            }
+            let text = summary.to_string();
+            assert!(!text.contains("KEY_MATERIAL_123"));
+            assert!(!text.contains("LEAK"));
+        }
+        // Even a syntactically complete retained prefix is not a complete body.
+        capture.complete = false;
+        capture.failure = Some("body_deadline_exceeded");
+        let summary = response_summary(200, &HeaderMap::new(), &capture);
+        assert_eq!(summary["body_shape"], "unavailable");
+        assert_eq!(summary["field_1_length_if_protobuf"], Value::Null);
+        assert_eq!(summary["field_2_length_if_protobuf"], Value::Null);
     }
 
     #[test]

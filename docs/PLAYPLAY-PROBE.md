@@ -148,7 +148,8 @@ saved report contains an allowlist:
 
 - HTTP status, approved MIME category, numeric Content-Length/Retry-After.
 - Observed/retained byte counts and whether the body completed.
-- JSON/protobuf-syntax/unknown shape; length of protobuf field 1 if safely parsed.
+- JSON/protobuf-syntax/unknown shape; lengths of protobuf fields 1 and 2 if safely
+  inspected, with absent fields reported as null.
 - Only recognized, fixed symbolic error codes. No arbitrary server messages.
 
 **Never saved:** raw request/response bodies, body previews, token bytes, cookies,
@@ -156,6 +157,22 @@ authorization headers, device IDs, usernames, account attributes, signed URLs,
 licenses, or content keys. A 16-byte protobuf field is only shape evidence.
 Unknown server messages are deliberately not persisted; investigate any need for
 additional evidence explicitly rather than enabling unrestricted logging.
+
+Static response-path inspection of the pinned DLL found a 16-byte field-1 gate
+before transformation, and a separate field 2 copied only when its length is
+four. Field 2's meaning and missing/wrong-length fallback remain unknown. The
+probe reports lengths without enforcing those sizes, interpreting field 2, or
+claiming native acceptance. An absent field is not a zero-valued field.
+
+The shape inspector is deliberately conservative, not a replica of the native
+protobuf parser. Duplicate or wrong-wire fields 1/2, groups and messages over its
+1,024-field inspection budget are unclassified; that does not necessarily mean
+invalid protobuf. Unknown fields using supported wire types remain opaque.
+Nonminimal varints are accepted without inferring native canonicality rules.
+Synthetic fixtures exercise these boundaries and incomplete captures. Even a
+24-byte message with field lengths 16 and 4 is only one possible envelope—not a
+reconstruction of an earlier response whose bytes were discarded. Older reports
+without the field-2 length cannot supply that observation retrospectively.
 
 The executable installs no library logger, so `RUST_LOG` cannot enable the known
 credential/URL logging paths. The OAuth library prints a browser authorization
