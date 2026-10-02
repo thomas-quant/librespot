@@ -1799,10 +1799,14 @@ dependencies = [
 name = "librespot"
 version = "0.8.0"
 dependencies = [
+ "bytes",
  "data-encoding",
  "env_logger",
  "futures-util",
  "getopts",
+ "http",
+ "http-body",
+ "http-body-util",
  "librespot-audio",
  "librespot-connect",
  "librespot-core",
@@ -1812,7 +1816,9 @@ dependencies = [
  "librespot-playback",
  "librespot-protocol",
  "log",
+ "serde_json",
  "sha1",
+ "sha2",
  "sysinfo",
  "thiserror 2.0.17",
  "tokio",

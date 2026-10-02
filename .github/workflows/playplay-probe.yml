@@ -1,0 +1,85 @@
+name: playplay-probe
+
+"on":
+  push:
+    branches:
+      - feat/playplay-probe-v5
+    paths:
+      - ".github/workflows/playplay-probe.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "examples/playplay_probe.rs"
+      - "examples/support/playplay_probe.rs"
+      - "docs/PLAYPLAY-PROBE.md"
+      - "core/**"
+      - "metadata/**"
+      - "oauth/**"
+      - "protocol/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playplay-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  offline-tests-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: playplay-probe-linux-native-tls
+
+      - name: Install native TLS development dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Check probe formatting
+        run: rustfmt --edition 2024 --check examples/playplay_probe.rs
+
+      - name: Run synthetic offline tests
+        run: cargo test --locked --example playplay_probe --no-default-features --features native-tls
+
+      - name: Check probe and test lints
+        run: cargo clippy --locked --example playplay_probe --tests --no-default-features --features native-tls -- -D warnings
+
+      - name: Build request-only executable
+        run: cargo build --locked --example playplay_probe --no-default-features --features native-tls
+
+      - name: Offline help smoke test
+        run: target/debug/examples/playplay_probe --help
+
+      - name: Package executable and checksums
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/debug/examples/playplay_probe dist/playplay_probe
+          strip --strip-debug dist/playplay_probe
+          cp docs/PLAYPLAY-PROBE.md dist/README.md
+          printf '%s\n' "$GITHUB_SHA" > dist/SOURCE_COMMIT
+          (cd dist && sha256sum playplay_probe README.md SOURCE_COMMIT > SHA256SUMS)
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: playplay-probe-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
