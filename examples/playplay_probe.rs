@@ -1,10 +1,10 @@
-//! One-request PlayPlay compatibility diagnostic, NOT a player or deobfuscator.
-//!
-//! Default mode is offline: validate the exact researched DLL and request profile.
-//! `--send` explicitly enables OAuth/session/metadata and at most one application-
-//! level PlayPlay POST. No retry, diagnostic repost, CDN fetch, or key decryption.
-//! See docs/PLAYPLAY-PROBE.md. Reports contain allowlisted metadata, never payloads.
+//! One-request PlayPlay diagnostic, NOT a production key manager or player.
+//! Default is offline. `--send` makes at most one application-level PlayPlay POST.
+//! Optional `--try-legacy-decode` tests two unproven historical candidates against
+//! one matching encrypted audio prefix. Nothing sensitive is retained in reports.
 
+#[path = "support/playplay_decode.rs"]
+mod decode;
 #[path = "support/playplay_probe.rs"]
 mod probe;
 
@@ -45,6 +45,7 @@ struct Options {
     expected_tier: &'static str,
     send: bool,
     access_token_file: Option<PathBuf>,
+    decode: Option<(PathBuf, PathBuf)>,
     report: PathBuf,
 }
 
@@ -124,6 +125,23 @@ fn options(args: &[String]) -> Result<Option<Options>> {
         "new JSON file; never overwrite an existing file",
         "PATH",
     );
+    cli.optflag(
+        "",
+        "try-legacy-decode",
+        "test unproven legacy candidates on one real OGG96 prefix",
+    );
+    cli.optopt(
+        "",
+        "legacy-worker",
+        "CI-built bounded legacy candidate worker",
+        "PATH",
+    );
+    cli.optopt(
+        "",
+        "legacy-table",
+        "local hash-pinned legacy table; never uploaded",
+        "PATH",
+    );
     let parsed = cli
         .parse(args)
         .map_err(|_| Failure::new("arguments", "invalid_options"))?;
@@ -145,6 +163,28 @@ fn options(args: &[String]) -> Result<Option<Options>> {
         "ogg320" => AudioFileFormat::OGG_VORBIS_320,
         "aac24" => AudioFileFormat::AAC_24,
         _ => return Err(Failure::new("arguments", "unsupported_format")),
+    };
+    let decode = if parsed.opt_present("try-legacy-decode") {
+        if format != AudioFileFormat::OGG_VORBIS_96 {
+            return Err(Failure::new("arguments", "decode_candidate_requires_ogg96"));
+        }
+        Some((
+            PathBuf::from(
+                parsed
+                    .opt_str("legacy-worker")
+                    .ok_or_else(|| Failure::new("arguments", "legacy_worker_required"))?,
+            ),
+            PathBuf::from(
+                parsed
+                    .opt_str("legacy-table")
+                    .ok_or_else(|| Failure::new("arguments", "legacy_table_required"))?,
+            ),
+        ))
+    } else {
+        if parsed.opt_present("legacy-worker") || parsed.opt_present("legacy-table") {
+            return Err(Failure::new("arguments", "decode_flag_required"));
+        }
+        None
     };
     let expected_tier = match parsed.opt_str("expected-tier").as_deref().unwrap_or("free") {
         "free" => "free",
@@ -174,6 +214,7 @@ fn options(args: &[String]) -> Result<Option<Options>> {
         expected_tier,
         send: parsed.opt_present("send"),
         access_token_file: parsed.opt_str("access-token-file").map(PathBuf::from),
+        decode,
         report,
     }))
 }
@@ -356,7 +397,12 @@ fn endpoint(base: &str, file: FileId) -> Result<url::Url> {
     Ok(url)
 }
 
-async fn live(options: &Options, token: &[u8; 16], report: &mut Value) -> Result<()> {
+async fn live(
+    options: &Options,
+    token: &[u8; 16],
+    candidate: Option<&decode::CandidateProfile>,
+    report: &mut Value,
+) -> Result<()> {
     let credentials = credentials(options).await?;
     let session = Session::new(SessionConfig::default(), None);
     deadline("session", session.connect(credentials, false)).await?;
@@ -375,6 +421,12 @@ async fn live(options: &Options, token: &[u8; 16], report: &mut Value) -> Result
         return Err(Failure::new("tier", "expected_tier_not_confirmed"));
     }
     let file = select_file(&session, options, report).await?;
+    // Resolve/fetch the matching encrypted prefix before spending the one POST.
+    let audio = if candidate.is_some() {
+        Some(decode::audio_prefix(&session, file, report).await?)
+    } else {
+        None
+    };
     let base = deadline("endpoint", session.spclient().base_url()).await?;
     let url = endpoint(&base, file)?;
     report["request_host"] = json!(url.host_str());
@@ -431,13 +483,38 @@ async fn live(options: &Options, token: &[u8; 16], report: &mut Value) -> Result
         probe::capture_with_deadline(response.into_body(), probe::BODY_LIMIT, BODY_TIMEOUT).await;
     report["response"] = probe::response_summary(status, &headers, &capture);
     report["outcome"] = report["response"]["outcome"].clone();
+    if let Some(candidate) = candidate {
+        if status != 200 && (200..300).contains(&status) {
+            return Err(Failure::new("response_contract", "expected_http_200"));
+        }
+        if status == 200 && capture.complete {
+            let material = probe::response_material(&capture.bytes)
+                .ok_or_else(|| Failure::new("response_contract", "expected_single_16byte_field"))?;
+            decode::run(
+                file,
+                material,
+                candidate,
+                audio
+                    .as_deref()
+                    .ok_or_else(|| Failure::new("cdn", "prefix_missing"))?,
+                report,
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    // Deliberately no env_logger initialization, even with RUST_LOG set.
+    // Deliberately no logger, even with RUST_LOG; redact panic payloads as well.
+    std::panic::set_hook(Box::new(|_| {
+        let _ = std::io::stderr().write_all(b"probe_internal_error\n");
+    }));
     let args: Vec<String> = env::args().skip(1).collect();
+    if args == ["--decode-child"] {
+        return ExitCode::from(decode::decoder_child());
+    }
     let options = match options(&args) {
         Ok(Some(options)) => options,
         Ok(None) => return ExitCode::SUCCESS,
@@ -457,7 +534,10 @@ async fn main() -> ExitCode {
     };
     let mut report = json!({
         "schema_version": 1,
-        "mode": if options.send { "live_request_only" } else { "offline_profile_check" },
+        "mode": if options.send && options.decode.is_some() { "live_legacy_candidate_attempt" }
+                else if options.send { "live_request_only" } else { "offline_profile_check" },
+        "decode_requested": options.decode.is_some(),
+        "cdn_dispatch_calls": 0,
         "outcome": "not_sent",
         "profile": {"version": 5, "source_dll_version": "1.3.1.234",
                     "dll_sha256": probe::DLL_SHA256, "token_sha256": probe::TOKEN_SHA256,
@@ -476,22 +556,32 @@ async fn main() -> ExitCode {
         "license_validated": false, "decryption_tested": false, "playback_tested": false,
         "tier_restriction_established": false
     });
-    let result = match profile(&options) {
-        Ok(token) => {
-            report["profile"]["validated"] = json!(true);
-            if options.send {
-                live(&options, &token, &mut report).await
-            } else {
-                report["outcome"] = json!("offline_profile_validated_no_network");
-                Ok(())
-            }
+    let result = async {
+        let token = profile(&options)?;
+        report["profile"]["validated"] = json!(true);
+        let candidate = if let Some((worker, table)) = &options.decode {
+            decode::disable_core_dumps()?;
+            let candidate = decode::candidate_profile(worker, table)?;
+            decode::preflight(&candidate).await?;
+            report["candidate_worker_preflight"] = json!("passed_not_compatibility_proof");
+            Some(candidate)
+        } else {
+            None
+        };
+        if options.send {
+            live(&options, &token, candidate.as_ref(), &mut report).await
+        } else {
+            report["outcome"] = json!("offline_profile_validated_no_network");
+            Ok(())
         }
-        Err(error) => Err(error),
-    };
+    }
+    .await;
     let exit = if let Err(error) = result {
         report["outcome"] = json!("diagnostic_error");
         report["error"] = error.report();
         1
+    } else if report["outcome"] == "tested_candidates_did_not_decode" {
+        5
     } else if report["response"]["body_complete"] == false {
         4
     } else if report["response"]["status"]

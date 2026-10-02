@@ -10,7 +10,10 @@ name: playplay-probe
       - "Cargo.lock"
       - "examples/playplay_probe.rs"
       - "examples/support/playplay_probe.rs"
+      - "examples/support/playplay_decode.rs"
+      - "examples/support/legacy_candidate/**"
       - "docs/PLAYPLAY-PROBE.md"
+      - "docs/PLAYPLAY-REALDATA-PROBE.md"
       - "core/**"
       - "metadata/**"
       - "oauth/**"
@@ -48,13 +51,28 @@ jobs:
         with:
           shared-key: playplay-probe-linux-native-tls
 
-      - name: Install native TLS development dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - name: Install diagnostic dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev g++ ffmpeg
+
+      - name: Build bounded historical candidate worker
+        run: |
+          mkdir -p dist
+          g++ -std=c++17 -O1 -fwrapv -fno-strict-aliasing -w \
+            examples/support/legacy_candidate/worker.cc \
+            examples/support/legacy_candidate/decrypt_main.cc \
+            examples/support/legacy_candidate/process.cc \
+            -o dist/legacy_candidate
+          python3 -B examples/support/legacy_candidate/smoke.py "$PWD/dist/legacy_candidate"
+
+      - name: Generate lawful decoder fixture
+        run: ffmpeg -nostdin -v error -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=6' -ac 2 -c:a libvorbis -b:a 96k "$RUNNER_TEMP/probe-tone.ogg"
 
       - name: Check probe formatting
         run: rustfmt --edition 2024 --check examples/playplay_probe.rs
 
-      - name: Run synthetic offline tests
+      - name: Run focused offline tests including actual PCM decode
+        env:
+          PROBE_SYNTHETIC_OGG: ${{ runner.temp }}/probe-tone.ogg
         run: cargo test --locked --example playplay_probe --no-default-features --features native-tls
 
       - name: Check probe and test lints
@@ -71,10 +89,11 @@ jobs:
         run: |
           mkdir -p dist
           cp target/debug/examples/playplay_probe dist/playplay_probe
-          strip --strip-debug dist/playplay_probe
+          strip --strip-debug dist/playplay_probe dist/legacy_candidate
           cp docs/PLAYPLAY-PROBE.md dist/README.md
+          cp docs/PLAYPLAY-REALDATA-PROBE.md dist/REALDATA.md
           printf '%s\n' "$GITHUB_SHA" > dist/SOURCE_COMMIT
-          (cd dist && sha256sum playplay_probe README.md SOURCE_COMMIT > SHA256SUMS)
+          (cd dist && sha256sum playplay_probe legacy_candidate README.md REALDATA.md SOURCE_COMMIT > SHA256SUMS)
 
       - name: Upload probe artifact
         uses: actions/upload-artifact@v4

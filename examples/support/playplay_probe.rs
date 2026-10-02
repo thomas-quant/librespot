@@ -246,6 +246,34 @@ fn protobuf_shape(input: &[u8]) -> Option<[Option<usize>; 2]> {
     Some(sizes)
 }
 
+/// Copy pre-transform material only, never interpret it as an audio key.
+/// The same conservative shape checks used by the report reject ambiguity.
+pub fn response_material(input: &[u8]) -> Option<[u8; 16]> {
+    if protobuf_shape(input)?[0] != Some(16) {
+        return None;
+    }
+    let mut position = 0;
+    while position < input.len() {
+        let tag = read_varint(input, &mut position)?;
+        let size = match tag & 7 {
+            0 => {
+                read_varint(input, &mut position)?;
+                0
+            }
+            1 => 8,
+            2 => usize::try_from(read_varint(input, &mut position)?).ok()?,
+            5 => 4,
+            _ => return None,
+        };
+        let end = position.checked_add(size)?;
+        if tag >> 3 == 1 {
+            return input.get(position..end)?.try_into().ok();
+        }
+        position = end;
+    }
+    None
+}
+
 fn known_error(value: &Value) -> Option<&'static str> {
     const ALLOWED: &[&str] = &[
         "PERMISSION_DENIED",
@@ -667,6 +695,12 @@ mod tests {
         let bytes = response_fixture(Some(16), Some(4));
         assert_eq!(bytes.len(), 24);
         assert_eq!(protobuf_shape(&bytes), Some([Some(16), Some(4)]));
+        assert_eq!(response_material(&bytes), Some([0xaa; 16]));
+        assert_eq!(
+            response_material(&response_fixture(Some(15), Some(4))),
+            None
+        );
+        assert_eq!(response_material(&response_fixture(None, Some(4))), None);
         // A complete first field alone is also recognized; field 2 is optional
         // to this inspector. Missing field 2 does not imply a zero-valued field.
         assert_eq!(protobuf_shape(&bytes[..18]), Some([Some(16), None]));

@@ -1,8 +1,10 @@
 # Request-only PlayPlay compatibility probe
 
-`examples/playplay_probe.rs` tests a **candidate request body**, not audio playback.
-It does not decrypt a response, fetch audio/CDN content, integrate a key manager,
-or use the locally collected Widevine device files.
+By default, `examples/playplay_probe.rs` tests a **candidate request body**, not
+audio playback. Its normal `--send` mode does not decrypt responses or fetch CDN
+audio. A separate, explicit `--try-legacy-decode` mode tests two unproven historical
+candidates against one real OGG96 prefix; see [the real-data guide](PLAYPLAY-REALDATA-PROBE.md).
+Neither mode integrates a production key manager or uses Widevine device files.
 
 ## What is being tested
 
@@ -33,12 +35,13 @@ version-5 response transformation/deobfuscator remains untested.
 
 The `playplay-probe` workflow tests and builds only this diagnostic on Ubuntu
 24.04 with Rust 1.97.1 and one Cargo job. It runs synthetic offline tests, Clippy,
-formatting, and an offline `--help` smoke test. It never receives Spotify
-credentials, an installed DLL, WVD samples, or local reports and never enables
-`--send`.
+formatting, a generated lawful Ogg/PCM fixture and an offline `--help` smoke test.
+It also builds the resource-bounded historical candidate worker without a table.
+It never receives Spotify credentials, an installed DLL, WVD samples, the local
+historical table or captured media/reports, and never enables `--send`.
 
-Its `playplay-probe-linux-x86_64` artifact contains `playplay_probe`, this guide,
-`SOURCE_COMMIT`, and `SHA256SUMS`. After download, run `sha256sum -c SHA256SUMS`
+Its `playplay-probe-linux-x86_64` artifact contains `playplay_probe`,
+`legacy_candidate`, this guide, `REALDATA.md`, `SOURCE_COMMIT`, and `SHA256SUMS`. After download, run `sha256sum -c SHA256SUMS`
 inside the artifact directory. Use that directory's `./playplay_probe` in place
 of `target/debug/examples/playplay_probe` in the commands below. The Linux
 executable requires compatible glibc/OpenSSL runtime libraries; it is not a
@@ -194,7 +197,11 @@ access; Windows ACLs govern Windows-side access.
 - **2:** invalid CLI or report destination; no live request made.
 - **3:** complete non-2xx response, with original-response summary saved.
 - **4:** response headers arrived but body capture was incomplete/truncated.
+- **5:** explicit real-data mode ran, but neither historical candidate decoded the
+  required prefix. This is not a verdict on all v5 transformations or Free playback.
 
-All reports explicitly leave licensing, decryption, playback, and universal
-account-tier restriction claims unestablished. Never turn an incomplete capture
-or a refusal into a categorical verdict about Spotify Free.
+Request-only reports leave licensing, decryption, playback and universal tier
+restriction claims unestablished. Real-data mode may validate only a decoded
+prefix; it still makes no license-policy, audible-playback or whole-track claim.
+Never turn an incomplete capture, refusal or candidate failure into a categorical
+verdict about Spotify Free.
